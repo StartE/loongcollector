@@ -1,8 +1,10 @@
 package k8smeta
 
 import (
+	"context"
 	"strings"
 
+	"github.com/alibaba/ilogtail/pkg/logger"
 	app "k8s.io/api/apps/v1"
 	batch "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
@@ -87,6 +89,7 @@ func (g *LinkGenerator) getPodNodeLink(podList []*K8sMetaEvent) []*K8sMetaEvent 
 	for _, event := range podList {
 		pod, ok := event.Object.Raw.(*v1.Pod)
 		if !ok {
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate pod-node link for  %s %s", event.Object.ResourceType, event.Object.Raw)
 			continue
 		}
 		nodes := nodeCache.Get([]string{pod.Spec.NodeName})
@@ -114,7 +117,11 @@ func (g *LinkGenerator) getPodDeploymentLink(podList []*K8sMetaEvent) []*K8sMeta
 	result := make([]*K8sMetaEvent, 0)
 	for _, data := range podList {
 		pod, ok := data.Object.Raw.(*v1.Pod)
-		if !ok || len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "ReplicaSet" {
+		if !ok{
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate pod-deployment link for  %s %s", data.Object.ResourceType, data.Object.Raw)
+			continue
+		}
+		if len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "ReplicaSet" {
 			continue
 		}
 		parentName := pod.OwnerReferences[0].Name
@@ -150,7 +157,11 @@ func (g *LinkGenerator) getReplicaSetDeploymentLink(rsList []*K8sMetaEvent) []*K
 	result := make([]*K8sMetaEvent, 0)
 	for _, event := range rsList {
 		replicaset, ok := event.Object.Raw.(*app.ReplicaSet)
-		if !ok || len(replicaset.OwnerReferences) == 0 {
+		if !ok {
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate replicaset-deployment link for  %s %s", event.Object.ResourceType, event.Object.Raw)
+			continue
+		}
+		if len(replicaset.OwnerReferences) == 0 {
 			continue
 		}
 		deploymentName := replicaset.OwnerReferences[0].Name
@@ -179,7 +190,11 @@ func (g *LinkGenerator) getPodReplicaSetLink(podList []*K8sMetaEvent) []*K8sMeta
 	result := make([]*K8sMetaEvent, 0)
 	for _, data := range podList {
 		pod, ok := data.Object.Raw.(*v1.Pod)
-		if !ok || len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "ReplicaSet" {
+		if ! ok {
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate pod-replicaset link for  %s %s", data.Object.ResourceType, data.Object.Raw)
+			continue
+		}
+		if len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "ReplicaSet" {
 			continue
 		}
 		parentName := pod.OwnerReferences[0].Name
@@ -208,7 +223,11 @@ func (g *LinkGenerator) getPodStatefulSetLink(podList []*K8sMetaEvent) []*K8sMet
 	result := make([]*K8sMetaEvent, 0)
 	for _, data := range podList {
 		pod, ok := data.Object.Raw.(*v1.Pod)
-		if !ok || len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "StatefulSet" {
+		if ! ok {
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate pod-statefulset link for  %s %s", data.Object.ResourceType, data.Object.Raw)
+			continue
+		}
+		if len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "StatefulSet" {
 			continue
 		}
 		parentName := pod.OwnerReferences[0].Name
@@ -237,7 +256,10 @@ func (g *LinkGenerator) getPodDaemonSetLink(podList []*K8sMetaEvent) []*K8sMetaE
 	result := make([]*K8sMetaEvent, 0)
 	for _, data := range podList {
 		pod, ok := data.Object.Raw.(*v1.Pod)
-		if !ok || len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "DaemonSet" {
+		if !ok {
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate pod-deployment link for  %s %s", data.Object.ResourceType, data.Object.Raw)
+		}
+		if len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "DaemonSet" {
 			continue
 		}
 		parentName := pod.OwnerReferences[0].Name
@@ -266,7 +288,10 @@ func (g *LinkGenerator) getPodJobLink(podList []*K8sMetaEvent) []*K8sMetaEvent {
 	result := make([]*K8sMetaEvent, 0)
 	for _, data := range podList {
 		pod, ok := data.Object.Raw.(*v1.Pod)
-		if !ok || len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "Job" {
+		if !ok {
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate pod-deployment link for  %s %s", data.Object.ResourceType, data.Object.Raw)
+		}
+		if len(pod.OwnerReferences) == 0 || pod.OwnerReferences[0].Kind != "Job" {
 			continue
 		}
 		parentName := pod.OwnerReferences[0].Name
@@ -295,7 +320,10 @@ func (g *LinkGenerator) getJobCronJobLink(jobList []*K8sMetaEvent) []*K8sMetaEve
 	result := make([]*K8sMetaEvent, 0)
 	for _, data := range jobList {
 		job, ok := data.Object.Raw.(*batch.Job)
-		if !ok || len(job.OwnerReferences) == 0 {
+		if !ok {
+			logger.Error(context.Background(), "K8S_META_LINK_ALARM", "faild to generate pod-deployment link for  %s %s", data.Object.ResourceType, data.Object.Raw)
+		}
+		if len(job.OwnerReferences) == 0 {
 			continue
 		}
 		cronJobName := job.OwnerReferences[0].Name

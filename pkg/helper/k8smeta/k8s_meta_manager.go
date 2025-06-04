@@ -86,6 +86,7 @@ func (m *MetaManager) Init(configPath string) (err error) {
 	if len(configPath) > 0 {
 		config, err = clientcmd.BuildConfigFromFlags("", configPath)
 		if err != nil {
+			logger.Error(context.Background(), "K8S_META_MANAGER_INIT_FAIL", "init fail from config path", err)
 			return err
 		}
 	} else {
@@ -95,6 +96,7 @@ func (m *MetaManager) Init(configPath string) (err error) {
 	// 创建 Kubernetes 客户端
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
+		logger.Error(context.Background(), "K8S_META_MANAGER_INIT_FAIL", "create k8s client set fail", err)
 		return err
 	}
 	m.clientset = clientset

@@ -87,6 +87,7 @@ func (m *k8sMetaCache) UnRegisterSendFunc(key string) {
 func (m *k8sMetaCache) watch(stopCh <-chan struct{}) {
 	factory, informer := m.getFactoryInformer()
 	if informer == nil {
+		logger.Error(context.Background(), "K8S_META_CACHE_WATCH_FAIL", "can not get a informer for %s", m.resourceType)
 		return
 	}
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
