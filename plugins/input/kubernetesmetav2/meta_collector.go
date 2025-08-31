@@ -22,6 +22,29 @@ import (
 
 const emptyJSONObjectString = "{}"
 
+// Smart capacity shrink parameters
+const (
+	baseEventCapacity     = 100               // Base capacity for event slices
+	shrinkThresholdFactor = 3                 // Shrink when capacity > base * factor
+	shrinkTargetFactor    = 2                 // Shrink to base * factor
+	sendBatchThreshold    = baseEventCapacity // Send when reaching this batch size
+)
+
+// smartShrinkEventSlice implements intelligent capacity shrinking to prevent memory bloat
+func smartShrinkEventSlice(events []models.PipelineEvent) []models.PipelineEvent {
+	currentCap := cap(events)
+
+	// If capacity is too large, shrink it intelligently
+	if currentCap > baseEventCapacity*shrinkThresholdFactor {
+		// Shrink to a reasonable size, not too small to avoid frequent reallocations
+		targetCap := baseEventCapacity * shrinkTargetFactor
+		return make([]models.PipelineEvent, 0, targetCap)
+	}
+
+	// Normal case: just reset length but keep reasonable capacity
+	return events[:0]
+}
+
 type metaCollector struct {
 	serviceK8sMeta *ServiceK8sMeta
 	collector      pipeline.Collector
@@ -351,7 +374,9 @@ func (m *metaCollector) sendInBackground() {
 			log := m.convertPipelineEvent2Log(e)
 			m.collector.AddRawLog(log)
 		}
-		group.Events = group.Events[:0]
+		// Smart capacity shrinking to prevent memory bloat from slice growth
+		// This replaces the problematic group.Events[:0] that caused C++ memory growth
+		group.Events = smartShrinkEventSlice(group.Events)
 	}
 	lastSendClusterTime := time.Now()
 
@@ -362,13 +387,13 @@ func (m *metaCollector) sendInBackground() {
 		select {
 		case e := <-m.entityBuffer:
 			entityGroup.Events = append(entityGroup.Events, e)
-			if len(entityGroup.Events) >= 100 {
+			if len(entityGroup.Events) >= sendBatchThreshold {
 				m.serviceK8sMeta.entityCount.Add(int64(len(entityGroup.Events)))
 				sendFunc(entityGroup)
 			}
 		case e := <-m.entityLinkBuffer:
 			linkGroup.Events = append(linkGroup.Events, e)
-			if len(linkGroup.Events) >= 100 {
+			if len(linkGroup.Events) >= sendBatchThreshold {
 				m.serviceK8sMeta.linkCount.Add(int64(len(linkGroup.Events)))
 				sendFunc(linkGroup)
 			}
