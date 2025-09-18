@@ -134,7 +134,6 @@ void Timer::InitMetrics() {
 
 void Timer::UpdateMetrics() {
     if (mQueueItemsTotal) {
-        lock_guard<mutex> lock(mQueueMux);
         mQueueItemsTotal->Set(mQueue.size());
     }
 }
