@@ -3,6 +3,7 @@ package kubernetesmetav2
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 
 	// #nosec G501
 	"crypto/md5"
@@ -31,6 +32,8 @@ type metaCollector struct {
 
 	stopCh          chan struct{}
 	entityProcessor map[string]ProcessFunc
+
+	dropCount uint64 // Counter for dropped events (for logging)
 }
 
 func (m *metaCollector) Start() error {
@@ -337,8 +340,19 @@ func (m *metaCollector) send(event models.PipelineEvent, entity bool) {
 	}
 	select {
 	case buffer <- event:
-	case <-time.After(3 * time.Second):
-		logger.Warning(context.Background(), k8smeta.K8sMetaUnifyErrorCode, "send event timeout, isEntity", entity)
+		// Successfully sent to buffer
+	default:
+		// Buffer is full, drop the event immediately without blocking
+		// This prevents blocking upstream event collection
+		// Data integrity is preserved because:
+		// 1. Cache in DeferredDeletionMetaStore already has the latest state
+		// 2. Timer-based full sync (every 5 minutes) will recover any dropped incremental updates
+		count := atomic.AddUint64(&m.dropCount, 1)
+		if count%1000 == 0 {
+			// Log every 1000 drops to avoid log flooding
+			logger.Warning(context.Background(), k8smeta.K8sMetaUnifyErrorCode,
+				"send buffer full, events dropped", "total_dropped", count, "isEntity", entity)
+		}
 	}
 }
 
