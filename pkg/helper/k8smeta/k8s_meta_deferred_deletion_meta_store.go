@@ -54,6 +54,7 @@ type TimerEvent struct {
 type SendFuncWithStopCh struct {
 	SendFunc SendFunc
 	StopCh   chan struct{}
+	EventCh  chan []*K8sMetaEvent
 }
 
 func NewDeferredDeletionMetaStore(eventCh chan *K8sMetaEvent, stopCh <-chan struct{}, gracePeriod int64, keyFunc cache.KeyFunc, indexRules ...IdxFunc) *DeferredDeletionMetaStore {
@@ -134,10 +135,12 @@ func (m *DeferredDeletionMetaStore) RegisterSendFunc(key string, f SendFunc, int
 	sendFuncWithStopCh := &SendFuncWithStopCh{
 		SendFunc: f,
 		StopCh:   make(chan struct{}),
+		EventCh:  make(chan []*K8sMetaEvent, 5000), // Increase buffer size to 5000
 	}
 	m.registerLock.Lock()
 	m.sendFuncs[key] = sendFuncWithStopCh
 	m.registerLock.Unlock()
+
 	go func() {
 		defer panicRecover()
 		event := &K8sMetaEvent{
@@ -164,6 +167,18 @@ func (m *DeferredDeletionMetaStore) RegisterSendFunc(key string, f SendFunc, int
 			select {
 			case <-ticker.C:
 				m.eventCh <- event
+			case e := <-sendFuncWithStopCh.EventCh:
+				sendFuncWithStopCh.SendFunc(e)
+				// batch drain events from channel
+				n := len(sendFuncWithStopCh.EventCh)
+				for i := 0; i < n && i < 2000; i++ {
+					select {
+					case next := <-sendFuncWithStopCh.EventCh:
+						sendFuncWithStopCh.SendFunc(next)
+					default:
+						break
+					}
+				}
 			case <-sendFuncWithStopCh.StopCh:
 				return
 			}
@@ -258,7 +273,14 @@ func (m *DeferredDeletionMetaStore) handleAddOrUpdateEvent(event *K8sMetaEvent) 
 	m.lock.Unlock()
 	m.registerLock.RLock()
 	for _, f := range m.sendFuncs {
-		f.SendFunc([]*K8sMetaEvent{event})
+		select {
+		case f.EventCh <- []*K8sMetaEvent{event}:
+		default:
+			// If channel is full, we have to drop the event to avoid blocking the main loop.
+			// Blocking here would cause DeltaFIFO to grow indefinitely and OOM.
+			// Since it's an update event, the next timer event (full list) will eventually sync the state.
+			logger.Warning(context.Background(), K8sMetaUnifyErrorCode, "send buffer full, dropping event", key)
+		}
 	}
 	m.registerLock.RUnlock()
 }
@@ -277,7 +299,11 @@ func (m *DeferredDeletionMetaStore) handleDeleteEvent(event *K8sMetaEvent) {
 	m.lock.Unlock()
 	m.registerLock.RLock()
 	for _, f := range m.sendFuncs {
-		f.SendFunc([]*K8sMetaEvent{event})
+		select {
+		case f.EventCh <- []*K8sMetaEvent{event}:
+		default:
+			logger.Warning(context.Background(), K8sMetaUnifyErrorCode, "send buffer full, dropping delete event", key)
+		}
 	}
 	m.registerLock.RUnlock()
 	go func() {
@@ -321,19 +347,39 @@ func (m *DeferredDeletionMetaStore) handleTimerEvent(event *K8sMetaEvent) {
 	m.registerLock.RLock()
 	defer m.registerLock.RUnlock()
 	if f, ok := m.sendFuncs[timerEvent.ConfigName]; ok {
-		allItems := make([]*K8sMetaEvent, 0)
+		allItems := make([]*K8sMetaEvent, 0, len(m.Items))
 		m.lock.RLock()
 		for _, obj := range m.Items {
 			if !obj.Deleted {
-				obj.LastObservedTime = time.Now().Unix()
+				// create a new ObjectWrapper to avoid data race when modifying LastObservedTime
+				newObj := *obj
+				newObj.LastObservedTime = time.Now().Unix()
 				allItems = append(allItems, &K8sMetaEvent{
 					EventType: EventTypeUpdate,
-					Object:    obj,
+					Object:    &newObj,
 				})
 			}
 		}
 		m.lock.RUnlock()
-		f.SendFunc(allItems)
+		// For timer events (full list), we also use the channel but non-blocking is tricky since it's huge.
+		// But since we are in handleEvent loop, we CANNOT block.
+		// However, timer event is triggered by the SAME goroutine that consumes EventCh (see RegisterSendFunc).
+		// Wait, no. RegisterSendFunc starts a goroutine that does:
+		// select { case <-ticker.C: m.eventCh <- event; case e <- EventCh: SendFunc(e) }
+		// So m.eventCh <- event sends to main loop.
+		// Main loop calls handleTimerEvent.
+		// handleTimerEvent needs to send 'allItems' to... whom?
+		// It calls f.SendFunc(allItems).
+		// If we change f.SendFunc to send to f.EventCh, it will be consumed by that same goroutine.
+		// Correct.
+
+		select {
+		case f.EventCh <- allItems:
+		default:
+			// If buffer is full during timer event, we probably should skip this full sync
+			// rather than blocking everything.
+			logger.Warning(context.Background(), K8sMetaUnifyErrorCode, "send buffer full, skipping timer event", timerEvent.ConfigName)
+		}
 	}
 }
 

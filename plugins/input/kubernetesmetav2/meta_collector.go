@@ -362,16 +362,55 @@ func (m *metaCollector) sendInBackground() {
 		select {
 		case e := <-m.entityBuffer:
 			entityGroup.Events = append(entityGroup.Events, e)
-			if len(entityGroup.Events) >= 100 {
+			if len(entityGroup.Events) >= 500 {
 				m.serviceK8sMeta.entityCount.Add(int64(len(entityGroup.Events)))
 				sendFunc(entityGroup)
 			}
+			// Check if there are more events in the buffer to process immediately
+			// This helps to drain the buffer faster
+			n := len(m.entityBuffer)
+			for i := 0; i < n && i < 5000; i++ { // batch read up to 5000 more
+				select {
+				case e := <-m.entityBuffer:
+					entityGroup.Events = append(entityGroup.Events, e)
+					if len(entityGroup.Events) >= 1000 { // Increase batch size for flushing
+						m.serviceK8sMeta.entityCount.Add(int64(len(entityGroup.Events)))
+						sendFunc(entityGroup)
+					}
+				default:
+					break
+				}
+			}
+			if len(entityGroup.Events) > 0 {
+				m.serviceK8sMeta.entityCount.Add(int64(len(entityGroup.Events)))
+				sendFunc(entityGroup)
+			}
+
 		case e := <-m.entityLinkBuffer:
 			linkGroup.Events = append(linkGroup.Events, e)
-			if len(linkGroup.Events) >= 100 {
+			if len(linkGroup.Events) >= 500 {
 				m.serviceK8sMeta.linkCount.Add(int64(len(linkGroup.Events)))
 				sendFunc(linkGroup)
 			}
+			// Batch drain for link buffer too
+			n := len(m.entityLinkBuffer)
+			for i := 0; i < n && i < 5000; i++ {
+				select {
+				case e := <-m.entityLinkBuffer:
+					linkGroup.Events = append(linkGroup.Events, e)
+					if len(linkGroup.Events) >= 1000 {
+						m.serviceK8sMeta.linkCount.Add(int64(len(linkGroup.Events)))
+						sendFunc(linkGroup)
+					}
+				default:
+					break
+				}
+			}
+			if len(linkGroup.Events) > 0 {
+				m.serviceK8sMeta.linkCount.Add(int64(len(linkGroup.Events)))
+				sendFunc(linkGroup)
+			}
+
 		case <-time.After(3 * time.Second):
 			if len(entityGroup.Events) > 0 {
 				m.serviceK8sMeta.entityCount.Add(int64(len(entityGroup.Events)))
