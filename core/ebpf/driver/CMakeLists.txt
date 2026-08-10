@@ -39,6 +39,46 @@ if (LINUX)
     set(ENABLE_AGENTSIGHT "${ENABLE_AGENTSIGHT}" CACHE BOOL "Build AgentSight library (libagentsight.so + agentsight.h)" FORCE)
     message(STATUS "ebpf/driver: ENABLE_AGENTSIGHT=${ENABLE_AGENTSIGHT} (coolbpf agentsight / libagentsight)")
 
+    # ─── TEMPORARY: pre-upstream agentsight patch ────────────────────────────
+    # Applied to the vendored coolbpf WORKING TREE before it is configured, because
+    # add_subdirectory below compiles files on disk rather than a git ref. This lets us
+    # build and test the fix while the upstream anolisa PR is still open, without
+    # inventing a coolbpf submodule commit that the CI cannot fetch from gitee.
+    #
+    # REMOVE this block (and the patch file) once the fix lands upstream and the coolbpf
+    # submodule pointer is bumped instead. Tracking: alibaba/anolisa
+    # "fix(sight): report pids in the observer namespace".
+    set(_AGENTSIGHT_PATCH "${CMAKE_SOURCE_DIR}/_thirdparty/patches/agentsight-observer-pidns.patch")
+    if (ENABLE_AGENTSIGHT AND EXISTS "${_AGENTSIGHT_PATCH}")
+        find_program(GIT_EXECUTABLE git REQUIRED)
+        set(_COOLBPF_DIR "${CMAKE_SOURCE_DIR}/_thirdparty/coolbpf")
+        # `git apply --reverse --check` succeeds only when the patch is ALREADY applied,
+        # which keeps re-configures (and warm CI caches) idempotent.
+        execute_process(
+                COMMAND "${GIT_EXECUTABLE}" apply --reverse --check -p1 "${_AGENTSIGHT_PATCH}"
+                WORKING_DIRECTORY "${_COOLBPF_DIR}"
+                RESULT_VARIABLE _AGENTSIGHT_PATCH_PRESENT
+                OUTPUT_QUIET ERROR_QUIET)
+        if (_AGENTSIGHT_PATCH_PRESENT EQUAL 0)
+            message(STATUS "ebpf/driver: agentsight observer-pidns patch already applied, skipping")
+        else ()
+            execute_process(
+                    COMMAND "${GIT_EXECUTABLE}" apply -p1 "${_AGENTSIGHT_PATCH}"
+                    WORKING_DIRECTORY "${_COOLBPF_DIR}"
+                    RESULT_VARIABLE _AGENTSIGHT_PATCH_RC
+                    ERROR_VARIABLE _AGENTSIGHT_PATCH_ERR)
+            # Fail loudly: a silently unpatched build would look like the fix does not work.
+            if (NOT _AGENTSIGHT_PATCH_RC EQUAL 0)
+                message(FATAL_ERROR
+                        "ebpf/driver: failed to apply ${_AGENTSIGHT_PATCH} in ${_COOLBPF_DIR}\n"
+                        "  ${_AGENTSIGHT_PATCH_ERR}\n"
+                        "  The coolbpf submodule may have moved past the patch base. "
+                        "Regenerate the patch, or drop it if the fix is already upstream.")
+            endif ()
+            message(STATUS "ebpf/driver: applied agentsight observer-pidns patch to coolbpf")
+        endif ()
+    endif ()
+
     # Now add the coolbpf subdirectory (adds agentsight/ when ENABLE_AGENTSIGHT is on).
     add_subdirectory(${CMAKE_SOURCE_DIR}/_thirdparty/coolbpf ${CMAKE_BINARY_DIR}/_thirdparty/coolbpf)
 

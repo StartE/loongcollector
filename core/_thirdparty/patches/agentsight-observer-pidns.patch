@@ -1,0 +1,472 @@
+From 83d0d2fae845a20d52e7b5c74346254c81aa9b76 Mon Sep 17 00:00:00 2001
+From: StartE <yili0618@qq.com>
+Date: Mon, 10 Aug 2026 15:37:42 +0800
+Subject: [PATCH] fix(sight): report pids in the observer namespace
+
+Every consumer of an event pid resolves it against user-space's own /proc
+-- cmdline, exe, maps, cgroup, and the /proc/<pid>/root paths uprobes
+attach to -- but the BPF side reported the target's innermost
+pid-namespace pid. The two agree only when observer and target share a
+namespace, which is why agentsight on a host and a sidecar with
+shareProcessNamespace both worked and the distinction went unnoticed. A
+DaemonSet with hostPID:true breaks it: the innermost pid is a
+container-local number that on the host either does not exist or belongs
+to an unrelated process, so discovery matched that process's cmdline
+instead, failed, and silently attached nothing -- not even a warning,
+because the wrong /proc entry reads back fine.
+
+Add a const volatile observer_pidns_is_init rodata flag, derived from the
+inode of /proc/self/ns/pid, and report the host tgid when it is set.
+Neither pid flavour is unconditionally correct, so the observer's location
+has to reach BPF somehow, and user-space cannot recover it afterwards:
+reversing a namespace pid means scanning every /proc/*/status for an NSpid
+match, which is O(processes) per exec event and ambiguous because the same
+container-local pid can exist in several containers.
+bpf_get_ns_current_pid_tgid() does not help either -- it returns -EINVAL
+unless the namespace named by (dev, ino) is the current task's own, so it
+translates nothing into an ancestor namespace. Carrying the answer in
+rodata keeps the branch constant-folded away by the verifier at load time,
+and defaulting it to false leaves an unconfigured object bit-for-bit on
+the previous behaviour.
+
+The flag is deliberately narrow rather than a general namespace-chain
+resolver. An observer that itself lives in a namespace and watches a
+target in a deeper nested one still gets the innermost pid, exactly as
+before; fixing that needs a bounded walk over the target's upid chain,
+which is more verifier surface than the two supported deployments justify.
+AgentScanner's empty-cmdline check keeps that case fail-closed, so it
+declines to attach rather than probing the wrong process.
+
+Fixes: b6a95632 ("feat(sight): support container PID namespace in BPF traced
+ process filtering and event emission")
+Assisted-by: Claude Code:2.1.211
+---
+ src/agentsight/src/bpf/common.h        |  69 ++++++++++++---
+ src/agentsight/src/bpf/procmon.bpf.c   |   4 +-
+ src/agentsight/src/probes/filewatch.rs |   4 +
+ src/agentsight/src/probes/filewrite.rs |   4 +
+ src/agentsight/src/probes/mod.rs       |   2 +
+ src/agentsight/src/probes/pidns.rs     | 118 +++++++++++++++++++++++++
+ src/agentsight/src/probes/procmon.rs   |   4 +
+ src/agentsight/src/probes/proctrace.rs |   6 ++
+ src/agentsight/src/probes/sslsniff.rs  |   4 +
+ src/agentsight/src/probes/tcpsniff.rs  |   4 +
+ src/agentsight/src/probes/udpdns.rs    |   4 +
+ 11 files changed, 209 insertions(+), 14 deletions(-)
+ create mode 100644 src/agentsight/src/probes/pidns.rs
+
+diff --git a/src/agentsight/src/bpf/common.h b/src/agentsight/src/bpf/common.h
+index 4080de1f..34329471 100644
+--- a/src/agentsight/src/bpf/common.h
++++ b/src/agentsight/src/bpf/common.h
+@@ -94,20 +94,64 @@ static inline u32 get_task_ns_pid(struct task_struct *task)
+   return BPF_CORE_READ(pid, numbers[level].nr);
+ }
+ 
+-/* Convenience wrapper: get the namespace PID of the current task.
++/* Set by user-space when it observes /proc through the initial pid namespace;
++ * see probes::pidns::observer_in_init_pidns() for how that is determined.
++ * Defaults to false so an unconfigured object keeps the historical behaviour. */
++const volatile bool observer_pidns_is_init = false;
++
++/*
++ * current_observer_pid - the current process's PID *as user-space sees it*.
++ *
++ * Every consumer of an event pid resolves it against user-space's own /proc --
++ * cmdline, maps, cgroup, and the /proc/<pid>/root uprobe paths -- and /proc is
++ * rendered in the *reader's* pid namespace. So the number reported here has to
++ * be the one valid in user-space's namespace.
++ *
++ * get_task_ns_pid() returns the target's *innermost* namespace pid. That is the
++ * right answer only when observer and target share a namespace: agentsight on a
++ * host, or a sidecar with shareProcessNamespace, which is why the distinction
++ * went unnoticed. It is the wrong answer when user-space sits in the initial
++ * namespace and the target is inside a container -- a DaemonSet with
++ * hostPID:true -- because a container-local pid either does not exist on the
++ * host or, worse, belongs to an unrelated process that then gets probed in its
++ * place.
++ *
++ * For an initial-namespace observer the correct number is simply the host tgid,
++ * which every task has, so no namespace walking is needed. Note that
++ * bpf_get_ns_current_pid_tgid() cannot serve here: it returns -EINVAL unless the
++ * namespace named by (dev, ino) is the *current task's own*, so it does not
++ * translate into an ancestor namespace.
++ *
++ * We take the tgid rather than the tid for the same reason get_task_ns_pid()
++ * reads the group leader: a syscall may run on a worker thread (e.g.
++ * aiohttp/uvloop doing getaddrinfo in a thread pool), and the event pid must
++ * stay process-level so it correlates with sslsniff and cmdline/DNS discovery.
++ */
++static __always_inline u32 current_observer_pid(void)
++{
++    if (observer_pidns_is_init)
++        return (u32)(bpf_get_current_pid_tgid() >> 32);
++
++    return get_task_ns_pid((struct task_struct *)bpf_get_current_task());
++}
++
++/* Convenience wrapper: get the observer-namespace PID of the current task.
+  * In non-container scenarios this equals bpf_get_current_pid_tgid() >> 32. */
+ static __always_inline u32 current_ns_pid(void)
+ {
+-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+-    return get_task_ns_pid(task);
++    return current_observer_pid();
+ }
+ 
+ /*
+  * is_pid_traced - check whether the current process should be traced.
+  *
+- * Returns the namespace PID (to use for event->pid) if the process is traced,
+- * or 0 if it should be skipped. Checks both host PID and container ns_pid so
+- * that user-space can register either PID and get correct matching.
++ * Returns the PID to use for event->pid if the process is traced, or 0 if it
++ * should be skipped. Checks both the host PID and the observer-namespace PID,
++ * so user-space may register either and still get a match.
++ *
++ * The returned pid is deliberately whichever key hit the map: that keeps
++ * event->pid equal to the pid user-space registered, which is what lets
++ * ConnectionId(pid, ssl_ptr) correlate with the discovery-side caches.
+  */
+ #ifndef NO_TRACED_PROCESSES_MAP
+ static __always_inline u32 is_pid_traced(u32 host_pid)
+@@ -116,15 +160,14 @@ static __always_inline u32 is_pid_traced(u32 host_pid)
+     if (traced)
+         return host_pid;
+ 
+-    /* Container scenario: host PID != namespace PID.
+-     * Resolve the current task's ns_pid and retry the lookup. */
+-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+-    u32 ns_pid = get_task_ns_pid(task);
++    /* Container scenario: host PID != observer-namespace PID.
++     * Resolve the pid as user-space sees it and retry the lookup. */
++    u32 observer_pid = current_observer_pid();
+ 
+-    if (ns_pid != host_pid) {
+-        traced = bpf_map_lookup_elem(&traced_processes, &ns_pid);
++    if (observer_pid != host_pid) {
++        traced = bpf_map_lookup_elem(&traced_processes, &observer_pid);
+         if (traced)
+-            return ns_pid;
++            return observer_pid;
+     }
+ 
+     return 0;
+diff --git a/src/agentsight/src/bpf/procmon.bpf.c b/src/agentsight/src/bpf/procmon.bpf.c
+index 8a51852d..4f0827b2 100644
+--- a/src/agentsight/src/bpf/procmon.bpf.c
++++ b/src/agentsight/src/bpf/procmon.bpf.c
+@@ -55,7 +55,9 @@ int trace_execve_exit(struct syscall_trace_exit *ctx)
+     // Fill event
+     event->source = EVENT_SOURCE_PROCMON;
+     event->timestamp_ns = ts;
+-    event->pid = get_task_ns_pid(task);
++    // Report the pid as user-space's /proc will show it, not the target's
++    // innermost-namespace pid; user-space resolves cmdline/exe from this.
++    event->pid = current_observer_pid();
+     event->tid = tid;
+     event->ppid = ppid;
+     event->uid = uid;
+diff --git a/src/agentsight/src/probes/filewatch.rs b/src/agentsight/src/probes/filewatch.rs
+index c059a907..4e536fb1 100644
+--- a/src/agentsight/src/probes/filewatch.rs
++++ b/src/agentsight/src/probes/filewatch.rs
+@@ -11,6 +11,7 @@ use libbpf_rs::{
+ };
+ use std::mem::MaybeUninit;
+ 
++use super::pidns::observer_in_init_pidns;
+ use super::shared_maps::{MapKind, SharedMaps};
+ 
+ // ─── Generated skeleton ───────────────────────────────────────────────────────
+@@ -112,6 +113,9 @@ impl FileWatch {
+         // Mirror the cgroup-filter rodata flag.
+         open_skel.rodata_mut().filter_cgroup_enabled = shared.cgroup_filter_enabled();
+ 
++        // Tell BPF which namespace to report event pids in.
++        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
++
+         // Detect cgroup v2 and pass to BPF via rodata.
+         open_skel.rodata_mut().cgroup_v2_mode =
+             std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+diff --git a/src/agentsight/src/probes/filewrite.rs b/src/agentsight/src/probes/filewrite.rs
+index 82c4d918..0e509032 100644
+--- a/src/agentsight/src/probes/filewrite.rs
++++ b/src/agentsight/src/probes/filewrite.rs
+@@ -11,6 +11,7 @@ use libbpf_rs::{
+ };
+ use std::mem::MaybeUninit;
+ 
++use super::pidns::observer_in_init_pidns;
+ use super::shared_maps::{MapKind, SharedMaps};
+ 
+ // ─── Generated skeleton ───────────────────────────────────────────────────────
+@@ -119,6 +120,9 @@ impl FileWrite {
+         // Cgroup filter flag
+         open_skel.rodata_mut().filter_cgroup_enabled = shared.cgroup_filter_enabled();
+ 
++        // Tell BPF which namespace to report event pids in.
++        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
++
+         // Detect cgroup v2 and pass to BPF via rodata.
+         open_skel.rodata_mut().cgroup_v2_mode =
+             std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+diff --git a/src/agentsight/src/probes/mod.rs b/src/agentsight/src/probes/mod.rs
+index 36b44a93..19bd9699 100644
+--- a/src/agentsight/src/probes/mod.rs
++++ b/src/agentsight/src/probes/mod.rs
+@@ -1,6 +1,7 @@
+ #![allow(clippy::module_inception)]
+ pub mod filewatch;
+ pub mod filewrite;
++pub mod pidns;
+ pub mod probes;
+ pub mod procmon;
+ pub mod proctrace;
+@@ -15,6 +16,7 @@ mod elf_buildid;
+ // Re-export commonly used types
+ pub use filewatch::{FileWatch, FileWatchEvent};
+ pub use filewrite::{FileWrite as FileWriteProbe, FileWriteEvent};
++pub use pidns::observer_in_init_pidns;
+ pub use probes::{Probes, ProbesPoller};
+ pub use procmon::{Event as ProcMonEventExt, ProcMon, ProcMonEvent};
+ pub use proctrace::{ProcPoller, ProcTrace, VariableEvent as ProcEvent};
+diff --git a/src/agentsight/src/probes/pidns.rs b/src/agentsight/src/probes/pidns.rs
+new file mode 100644
+index 00000000..7b8f7eac
+--- /dev/null
++++ b/src/agentsight/src/probes/pidns.rs
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
++// Copyright (c) 2025 AgentSight Project
++//
++// Which pid namespace does this process observe `/proc` through?
++//
++// Every pid that comes out of a BPF event is eventually resolved against our
++// own `/proc` -- cmdline, exe, maps, cgroup, and the `/proc/<pid>/root` paths
++// uprobes attach to. `/proc` numbers processes in the *reader's* pid namespace,
++// so BPF has to report the pid in *our* namespace, not the target's innermost
++// one. The BPF side needs one bit to decide that (see `current_observer_pid()`
++// in `src/bpf/common.h`), and this module computes it.
++//
++// The bit is "are we in the initial pid namespace". That is the only case where
++// we can be certain our namespace is an ancestor of every process on the box,
++// and therefore that every task has a pid we can resolve -- its host pid. When
++// we are inside a namespace instead, the only processes we can see are the ones
++// sharing it, whose innermost-namespace pid is already the number our `/proc`
++// shows, which is the historical behaviour.
++
++use std::os::unix::fs::MetadataExt;
++use std::sync::OnceLock;
++
++/// Inode number of the initial pid namespace. Fixed by the kernel as
++/// `PROC_PID_INIT_INO` (`include/linux/proc_ns.h`) and part of the `/proc` ABI,
++/// which is what makes comparing against it a stable check.
++const PROC_PID_INIT_INO: u64 = 0xEFFF_FFFC;
++
++/// Path whose inode identifies our pid namespace.
++const SELF_PIDNS: &str = "/proc/self/ns/pid";
++
++/// Whether this process observes `/proc` through the initial pid namespace.
++///
++/// Cached: a process cannot change its own pid namespace (only children placed
++/// via `setns`/`unshare` get a new one), so this is fixed for our lifetime.
++///
++/// Probes copy this into their BPF `observer_pidns_is_init` rodata flag between
++/// `open()` and `load()`.
++pub fn observer_in_init_pidns() -> bool {
++    static CACHED: OnceLock<bool> = OnceLock::new();
++    *CACHED.get_or_init(|| {
++        let ino = match std::fs::metadata(SELF_PIDNS) {
++            Ok(md) => md.ino(),
++            Err(e) => {
++                // Hidden /proc, or a kernel without nsfs. Assume we are not in
++                // the initial namespace: that keeps the historical behaviour
++                // rather than asserting a host-pid view we cannot back up.
++                log::warn!(
++                    "failed to stat {SELF_PIDNS} ({e}); assuming a non-initial pid namespace, \
++                     event pids will use the target's innermost namespace"
++                );
++                return false;
++            }
++        };
++        let is_init = is_init_pidns_ino(ino);
++        log::debug!(
++            "observer pid namespace inode {ino:#x} (init={is_init}); event pids will be {}",
++            if is_init {
++                "host pids"
++            } else {
++                "innermost-namespace pids"
++            }
++        );
++        is_init
++    })
++}
++
++/// Whether a pid-namespace inode number is the initial namespace's.
++///
++/// Split out from [`observer_in_init_pidns`] so the comparison is testable
++/// without depending on which namespace the test runner happens to be in.
++fn is_init_pidns_ino(ino: u64) -> bool {
++    ino == PROC_PID_INIT_INO
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn init_pidns_inode_is_recognized() {
++        assert!(is_init_pidns_ino(PROC_PID_INIT_INO));
++        // The documented value, spelled out so a typo in the constant fails here.
++        assert!(is_init_pidns_ino(4_026_531_836));
++    }
++
++    #[test]
++    fn other_pidns_inodes_are_rejected() {
++        // Namespaces created after boot get ordinary nsfs inode numbers well
++        // below the initial-namespace magic value.
++        assert!(!is_init_pidns_ino(4_026_532_000));
++        assert!(!is_init_pidns_ino(PROC_PID_INIT_INO - 1));
++        assert!(!is_init_pidns_ino(PROC_PID_INIT_INO + 1));
++        assert!(!is_init_pidns_ino(0));
++    }
++
++    #[test]
++    fn observer_lookup_agrees_with_a_direct_stat() {
++        // Whichever namespace the test runner is in, the cached lookup must
++        // report what stat()ing the namespace link says.
++        let expected = std::fs::metadata(SELF_PIDNS)
++            .map(|md| is_init_pidns_ino(md.ino()))
++            .expect("stat /proc/self/ns/pid");
++        assert_eq!(observer_in_init_pidns(), expected);
++    }
++
++    #[test]
++    fn self_pidns_inode_matches_the_symlink_target() {
++        // Guards the assumption that stat()ing the magic symlink yields the
++        // nsfs inode, i.e. the number inside "pid:[...]" -- that identity is
++        // what makes the init comparison meaningful.
++        let link = std::fs::read_link(SELF_PIDNS).expect("read_link /proc/self/ns/pid");
++        let text = link.to_string_lossy();
++        let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
++        let from_link: u64 = digits.parse().expect("inode digits in pid:[...]");
++        let from_stat = std::fs::metadata(SELF_PIDNS).expect("stat").ino();
++        assert_eq!(from_link, from_stat);
++    }
++}
+diff --git a/src/agentsight/src/probes/procmon.rs b/src/agentsight/src/probes/procmon.rs
+index 8c40d317..62da07bb 100644
+--- a/src/agentsight/src/probes/procmon.rs
++++ b/src/agentsight/src/probes/procmon.rs
+@@ -11,6 +11,7 @@ use libbpf_rs::{
+ };
+ use std::mem::MaybeUninit;
+ 
++use super::pidns::observer_in_init_pidns;
+ use super::shared_maps::{MapKind, SharedMaps};
+ 
+ // ─── Generated skeleton ───────────────────────────────────────────────────────
+@@ -146,6 +147,9 @@ impl ProcMon {
+         let open_object = Box::new(MaybeUninit::<libbpf_rs::OpenObject>::uninit());
+         let mut open_skel = builder.open().context("failed to open BPF object")?;
+ 
++        // Tell BPF which namespace to report event pids in.
++        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
++
+         // Reuse the shared ring buffer.
+         shared
+             .reuse_into(SHARED_MAPS, open_skel.open_object_mut())
+diff --git a/src/agentsight/src/probes/proctrace.rs b/src/agentsight/src/probes/proctrace.rs
+index 9e1a0d53..a8de9101 100644
+--- a/src/agentsight/src/probes/proctrace.rs
++++ b/src/agentsight/src/probes/proctrace.rs
+@@ -20,6 +20,8 @@ use std::{
+     time::Duration,
+ };
+ 
++use super::pidns::observer_in_init_pidns;
++
+ // ─── Generated skeleton ───────────────────────────────────────────────────────
+ #[allow(
+     non_camel_case_types,
+@@ -408,6 +410,10 @@ impl ProcTrace {
+         // existing behavior is preserved when feature is unused.
+         open_skel.rodata_mut().filter_cgroup_enabled = cgroup_filter_enabled;
+ 
++        // Tell BPF which namespace to report event pids in. proctrace itself
++        // reports host pids, but it shares common.h's is_pid_traced() gate.
++        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
++
+         // Detect cgroup v2 unified hierarchy and pass to BPF via rodata.
+         // When true, get_cgroup_id_compat() uses bpf_get_current_cgroup_id() directly.
+         // When false, it CO-RE reads the v1 memory subsys cgroup.
+diff --git a/src/agentsight/src/probes/sslsniff.rs b/src/agentsight/src/probes/sslsniff.rs
+index e00d6ad9..1996a63e 100644
+--- a/src/agentsight/src/probes/sslsniff.rs
++++ b/src/agentsight/src/probes/sslsniff.rs
+@@ -12,6 +12,7 @@ use libbpf_rs::{
+ };
+ use procfs::process::Process;
+ 
++use super::pidns::observer_in_init_pidns;
+ use super::shared_maps::{MapKind, SharedMaps};
+ use std::{
+     collections::{HashMap, HashSet},
+@@ -267,6 +268,9 @@ impl SslSniff {
+         let open_object = Box::new(MaybeUninit::<libbpf_rs::OpenObject>::uninit());
+         let mut open_skel = builder.open().context("failed to open BPF object")?;
+ 
++        // Tell BPF which namespace to report event pids in.
++        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
++
+         // Reuse shared maps when running under the unified manager.
+         if let Some(shared) = shared {
+             shared
+diff --git a/src/agentsight/src/probes/tcpsniff.rs b/src/agentsight/src/probes/tcpsniff.rs
+index 580bf041..c9ec193d 100644
+--- a/src/agentsight/src/probes/tcpsniff.rs
++++ b/src/agentsight/src/probes/tcpsniff.rs
+@@ -21,6 +21,7 @@ use libbpf_rs::{
+ };
+ use std::{mem::MaybeUninit, net::Ipv4Addr};
+ 
++use super::pidns::observer_in_init_pidns;
+ use super::shared_maps::{MapKind, SharedMaps};
+ 
+ // --- Generated skeleton ---
+@@ -67,6 +68,9 @@ impl TcpSniff {
+             .open()
+             .context("failed to open tcpsniff BPF object")?;
+ 
++        // Tell BPF which namespace to report event pids in.
++        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
++
+         // Reuse the shared ring buffer.
+         shared
+             .reuse_into(SHARED_MAPS, open_skel.open_object_mut())
+diff --git a/src/agentsight/src/probes/udpdns.rs b/src/agentsight/src/probes/udpdns.rs
+index cd6840e4..d51345ba 100644
+--- a/src/agentsight/src/probes/udpdns.rs
++++ b/src/agentsight/src/probes/udpdns.rs
+@@ -15,6 +15,7 @@ use libbpf_rs::{
+ };
+ use std::mem::MaybeUninit;
+ 
++use super::pidns::observer_in_init_pidns;
+ use super::shared_maps::{MapKind, SharedMaps};
+ 
+ // --- Generated skeleton ---
+@@ -180,6 +181,9 @@ impl UdpDns {
+         let open_object = Box::new(MaybeUninit::<libbpf_rs::OpenObject>::uninit());
+         let mut open_skel = builder.open().context("failed to open udpdns BPF object")?;
+ 
++        // Tell BPF which namespace to report event pids in.
++        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
++
+         // Reuse shared ring buffer + process filter.
+         shared
+             .reuse_into(SHARED_MAPS, open_skel.open_object_mut())
+-- 
+2.43.7
+
